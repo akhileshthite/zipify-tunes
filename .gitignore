@@ -1,0 +1,9 @@
+node_modules/
+.env
+.DS_Store
+
+# Temporary upload folder (multer)
+uploads/
+
+# Temporary mp3 output folders (mp3s_<timestamp>)
+mp3s_*/

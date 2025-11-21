@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>ZipifyTunes</title>
+
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 30px;
+      max-width: 600px;
+      margin: auto;
+    }
+    .status {
+      margin-top: 20px;
+      padding: 10px;
+      border: 1px solid #ccc;
+      background: #f8f8f8;
+      height: 150px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-size: 13px;
+    }
+    .controls {
+      margin-bottom: 15px;
+    }
+    label {
+      font-size: 14px;
+    }
+
+    .hidden {
+      display: none;
+    }
+
+    /* Old-school progress bar */
+    .progress-wrapper {
+      margin-top: 20px;
+    }
+    .progress-container {
+      width: 100%;
+      background: #ddd;
+      border-radius: 4px;
+      border: 1px solid #bbb;
+      overflow: hidden;
+      height: 20px;
+    }
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: repeating-linear-gradient(
+        -45deg,
+        #f5f5f5,
+        #f5f5f5 10px,
+        #cfcfcf 10px,
+        #cfcfcf 20px
+      );
+      transition: width 0.3s ease;
+    }
+    .progress-text {
+      margin-top: 5px;
+      font-size: 12px;
+      text-align: right;
+      color: #555;
+    }
+
+    ol.steps {
+      margin-top: 20px;
+      padding-left: 20px;
+      font-size: 14px;
+    }
+    .footer {
+      font-size: 14px;
+    }
+    .footer:hover {
+      text-decoration: none;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>ZipifyTunes</h1>
+  <p>Select your <b>songs.csv</b> file (song, artist, etc. columns)</p>
+
+  <div class="controls">
+    <input type="file" id="csvFile" accept=".csv"><br><br>
+
+    <label for="quality">MP3 Quality:</label>
+    <select id="quality">
+      <option value="0">Best (VBR)</option>
+      <option value="128">128 kbps</option>
+      <option value="192">192 kbps</option>
+      <option value="256">256 kbps</option>
+      <option value="320">320 kbps</option>
+    </select>
+    <br><br>
+
+    <button onclick="uploadCSV()">Download MP3s</button>
+  </div>
+
+  <!-- Progress wrapper (hidden until download starts) -->
+  <div id="progressWrapper" class="progress-wrapper hidden">
+    <div class="progress-container">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div class="progress-text" id="progressText">Waiting…</div>
+  </div>
+
+  <h3>Status:</h3>
+  <div class="status" id="statusBox"></div>
+
+  <ol class="steps">
+    <li>
+      Export your Spotify playlist as a CSV from platforms like
+      <a href="https://www.chosic.com/spotify-playlist-exporter/" target="_blank" rel="noopener noreferrer">
+        https://www.chosic.com/spotify-playlist-exporter/
+      </a>
+    </li>
+    <li>Upload the CSV here.</li>
+    <li>
+      Get a ZIP of MP3 files with the chosen quality, embedded album art, and metadata.
+    </li>
+  </ol>
+
+  <a class="footer" href="https://github.com/akhileshthite/zipify-tunes/" target="_blank" rel="noopener noreferrer">
+    Source code
+  </a>
+
+  <script>
+    let progressTimer = null;
+    let progressStarted = false;
+
+    function log(msg) {
+      const box = document.getElementById("statusBox");
+      box.textContent += msg + "\n";
+      box.scrollTop = box.scrollHeight;
+    }
+
+    function setProgress(done, total) {
+      const bar = document.getElementById("progressBar");
+      const text = document.getElementById("progressText");
+
+      if (!total || total === 0) {
+        bar.style.width = "0%";
+        text.textContent = "Waiting…";
+        return;
+      }
+
+      const pct = Math.round((done / total) * 100);
+      bar.style.width = pct + "%";
+      text.textContent = `${done} / ${total} songs (${pct}%)`;
+    }
+
+    async function pollProgress() {
+      try {
+        const res = await fetch("/progress");
+        if (!res.ok) return;
+        const data = await res.json();
+
+        if (data.total > 0 && !progressStarted) {
+          progressStarted = true;
+          log("Downloading songs...");
+        }
+
+        setProgress(data.done, data.total);
+
+        if (data.total > 0 && data.done >= data.total) {
+          // all songs processed on the server
+          clearInterval(progressTimer);
+          progressTimer = null;
+        }
+      } catch (e) {
+        // ignore polling errors
+      }
+    }
+
+    async function uploadCSV() {
+      const fileInput = document.getElementById("csvFile");
+      const qualitySelect = document.getElementById("quality");
+      const progressWrapper = document.getElementById("progressWrapper");
+
+      if (!fileInput.files.length) {
+        alert("Please select a CSV file.");
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append("csv", fileInput.files[0]);
+      formData.append("quality", qualitySelect.value);
+
+      // show progress bar on click
+      progressWrapper.classList.remove("hidden");
+      progressStarted = false;
+      setProgress(0, 0);
+
+      log("Uploading CSV…");
+
+      // start polling progress as soon as we send request
+      if (!progressTimer) {
+        progressTimer = setInterval(pollProgress, 1000);
+      }
+
+      const response = await fetch("/upload", {
+        method: "POST",
+        body: formData
+      });
+
+      if (!response.ok) {
+        log("Server error.");
+        progressWrapper.classList.add("hidden");
+        return;
+      }
+
+      log("Processing… preparing download…");
+
+      // Server sends a ZIP file of all MP3s
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "songs.zip";
+      a.click();
+
+      log("Download ready!");
+
+      // hide progress bar when everything is done
+      progressWrapper.classList.add("hidden");
+    }
+  </script>
+</body>
+</html>
