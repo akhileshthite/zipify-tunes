@@ -61,7 +61,7 @@ Manual install: https://www.gyan.dev/ffmpeg/builds/
 
 ```bash
 # clone your repo
-git clone https://github.com/yourname/zipify-tunes.git
+git clone https://github.com/akhileshthite/zipify-tunes.git
 cd zipify-tunes
 
 # install dependencies
