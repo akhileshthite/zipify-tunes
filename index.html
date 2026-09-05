@@ -205,12 +205,26 @@
       });
 
       if (!response.ok) {
-        log("Server error.");
+        let detail = null;
+        try {
+          detail = await response.json();
+        } catch (e) {
+          // non-JSON error body
+        }
+
+        log(detail?.error || "Server error.");
+        (detail?.failures || []).forEach((f) => log("  • " + f));
         progressWrapper.classList.add("hidden");
         return;
       }
 
       log("Processing… preparing download…");
+
+      const downloaded = response.headers.get("X-Zipify-Downloaded");
+      const failed = response.headers.get("X-Zipify-Failed");
+      if (downloaded) {
+        log(`Got ${downloaded} song(s)` + (Number(failed) ? `, ${failed} failed` : ""));
+      }
 
       // Server sends a ZIP file of all MP3s
       const blob = await response.blob();
