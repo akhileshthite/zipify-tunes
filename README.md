@@ -27,7 +27,7 @@ ZipifyTunes lets you take back control; your music, your files, your way.
 - **Upload:** The CSV you upload is stored briefly in `/uploads/` by `multer` and removed when the process finishes
 - **Search:** `yt-search` finds the best matching YouTube video for each track
 - **Download:** `youtube-dl-exec` (yt-dlp) downloads and converts audio to MP3 (saved temporarily inside an auto-generated folder like `mp3s_123456789/`). The server runs `yt-dlp -U` on startup, because YouTube keeps changing how it serves audio and an outdated yt-dlp fails every download with `HTTP Error 403: Forbidden`
-- **Covers:** iTunes Search API provides square artwork, saved temporarily then embedded
+- **Covers:** iTunes Search API provides square artwork, verified against the track's title and artist so a wrong cover is never embedded; if iTunes doesn't have the track, the YouTube thumbnail is centre-cropped to a square instead
 - **Tagging:** `ffmpeg` writes ID3 tags: title, artist, album, year, genre + embedded cover
 - **Packaging:** `archiver` builds a ZIP of all generated MP3s and streams it back to your browser
 - **Disk space:** a run needs about twice the playlist size free (the temp MP3s plus the ZIP your browser saves), so roughly 20 MB per track. ZipifyTunes checks this up front and refuses with a clear message instead of handing back a truncated ZIP

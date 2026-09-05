@@ -225,48 +225,129 @@ function downloadMP3 (url, outputTemplate, userQuality) {
   })
 }
 
-// 2) Fetch album art from iTunes (square) and save as JPG
-async function fetchAlbumArt (title, artist, tempFolder, fileBase) {
+// loose text comparison for matching search results: lowercase, drop
+// bracketed qualifiers like "(From "Delhi-6")" or "[2013 Remaster]",
+// drop "feat. …", and collapse everything else to single spaces
+function looseText (s) {
+  return String(s)
+    .toLowerCase()
+    .replace(/\(.*?\)|\[.*?\]/g, ' ')
+    .replace(/\b(feat|ft)\.?\s.*$/, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+}
+
+// "Pritam,KK,Sayeed Quadri" -> ["pritam", "kk", "sayeed quadri"]
+function splitArtists (artist) {
+  return String(artist)
+    .split(/[,;&/]|\s+(?:feat|ft)\.?\s+/i)
+    .map(looseText)
+    .filter(Boolean)
+}
+
+// Does this iTunes result actually look like our track? Loose queries return
+// plausible-looking wrong songs, and a wrong cover is worse than no cover.
+function itunesResultMatches (result, title, artists, album) {
+  const wantTitle = looseText(title)
+  const gotTitle = looseText(result.trackName || '')
+  if (!wantTitle || !gotTitle) return false
+
+  const titleOk = gotTitle.includes(wantTitle) || wantTitle.includes(gotTitle)
+  if (!titleOk) return false
+
+  const gotArtist = looseText(result.artistName || '')
+  const artistOk = artists.some((a) => gotArtist.includes(a))
+
+  const wantAlbum = looseText(album)
+  const gotAlbum = looseText(result.collectionName || '')
+  const albumOk = Boolean(wantAlbum) && gotAlbum.includes(wantAlbum)
+
+  return artistOk || albumOk
+}
+
+async function searchItunes (term) {
+  const url =
+    'https://itunes.apple.com/search?term=' +
+    encodeURIComponent(term) +
+    '&entity=song&limit=5'
+  const res = await fetch(url)
+  if (!res.ok) return []
+  const json = await res.json()
+  return json.results || []
+}
+
+async function downloadTo (url, filePath) {
+  const res = await fetch(url)
+  if (!res.ok) return false
+  const buffer = Buffer.from(await res.arrayBuffer())
+  await fs.promises.writeFile(filePath, buffer)
+  return true
+}
+
+// centre-crop an image to a square and resize to 600x600
+function squareCrop (inputPath, outputPath) {
+  return new Promise((resolve, reject) => {
+    const ff = spawn('ffmpeg', [
+      '-y',
+      '-v', 'error',
+      '-i', inputPath,
+      '-vf', 'crop=min(iw\\,ih):min(iw\\,ih),scale=600:600',
+      outputPath
+    ])
+    ff.on('close', (code) =>
+      code === 0 ? resolve() : reject(new Error('ffmpeg crop exited ' + code))
+    )
+    ff.on('error', reject)
+  })
+}
+
+// 2) Fetch square album art: iTunes first (real cover), YouTube thumbnail as
+// a fallback (usually the cover on a blurred background for "Topic" uploads,
+// otherwise a frame from the video)
+async function fetchAlbumArt ({ title, artist, album, video }, tempFolder, fileBase) {
+  const coverPath = `${tempFolder}/${fileBase}_cover.jpg`
+  const artists = splitArtists(artist)
+
   try {
-    const term = `${title} ${artist}`
-    const apiURL = `https://itunes.apple.com/search?term=${encodeURIComponent(
-      term
-    )}&entity=song&limit=1`
+    // iTunes can't cope with the full comma-joined artist list, so search a
+    // few narrower ways and take the first result that verifiably matches
+    const terms = [
+      `${title} ${artists[0] || ''}`.trim(),
+      album ? `${title} ${album}` : null,
+      title
+    ].filter(Boolean)
 
-    const res = await fetch(apiURL)
-    if (!res.ok) {
-      console.log('iTunes search failed:', res.status)
-      return null
+    for (const term of terms) {
+      const results = await searchItunes(term)
+      const hit = results.find((r) => itunesResultMatches(r, title, artists, album))
+      if (!hit || !hit.artworkUrl100) continue
+
+      // artworkUrl100 is 100x100; the same path serves larger squares
+      const artUrl = hit.artworkUrl100.replace(/100x100bb\.jpg$/, '600x600bb.jpg')
+      if (await downloadTo(artUrl, coverPath)) return coverPath
     }
 
-    const json = await res.json()
-    if (!json.results || !json.results.length) {
-      console.log('No iTunes result for:', term)
-      return null
+    console.log(`No iTunes match for "${title}", using the YouTube thumbnail`)
+
+    if (!video) return null
+
+    const rawPath = `${tempFolder}/${fileBase}_thumb.jpg`
+    const thumbUrls = [
+      `https://i.ytimg.com/vi/${video.videoId}/maxresdefault.jpg`,
+      video.image,
+      video.thumbnail
+    ].filter(Boolean)
+
+    for (const url of thumbUrls) {
+      if (!(await downloadTo(url, rawPath))) continue
+      await squareCrop(rawPath, coverPath)
+      await fs.promises.rm(rawPath, { force: true })
+      return coverPath
     }
 
-    // artworkUrl100 is square 100x100; we can often get a larger square:
-    // .../100x100bb.jpg -> .../600x600bb.jpg
-    let artUrl = json.results[0].artworkUrl100
-    if (artUrl) {
-      artUrl = artUrl.replace(/100x100bb\.jpg$/, '600x600bb.jpg')
-    }
-
-    const imgRes = await fetch(artUrl)
-    if (!imgRes.ok) {
-      console.log('Failed to download artwork:', artUrl)
-      return null
-    }
-
-    const arrayBuffer = await imgRes.arrayBuffer()
-    const buffer = Buffer.from(arrayBuffer)
-
-    const coverPath = `${tempFolder}/${fileBase}_cover.jpg`
-    await fs.promises.writeFile(coverPath, buffer)
-
-    return coverPath
+    return null
   } catch (err) {
-    console.log('Error fetching album art:', err)
+    console.log('Error fetching album art:', err.message || err)
     return null
   }
 }
@@ -559,8 +640,7 @@ async function runJob (job, songs, userQuality) {
 
       // 2) fetch nice square album art (movie/album style)
       const coverPath = await fetchAlbumArt(
-        title,
-        artist,
+        { title, artist, album, video },
         tempFolder,
         workBase
       )
@@ -683,5 +763,9 @@ app.get('/download/:id', (req, res) => {
   zip.finalize()
 })
 
-const port = process.env.PORT || 3000
-app.listen(port, () => console.log(`Server running at http://localhost:${port}`))
+if (require.main === module) {
+  const port = process.env.PORT || 3000
+  app.listen(port, () => console.log(`Server running at http://localhost:${port}`))
+}
+
+module.exports = { app, fetchAlbumArt, itunesResultMatches, splitArtists, looseText }
