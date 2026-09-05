@@ -127,7 +127,6 @@
 
   <script>
     let progressTimer = null;
-    let progressStarted = false;
 
     function log(msg) {
       const box = document.getElementById("statusBox");
@@ -150,27 +149,55 @@
       text.textContent = `${done} / ${total} songs (${pct}%)`;
     }
 
-    async function pollProgress() {
+    function formatBytes(bytes) {
+      if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + " GB";
+      return Math.round(bytes / 1024 ** 2) + " MB";
+    }
+
+    function stopPolling() {
+      clearInterval(progressTimer);
+      progressTimer = null;
+      document.getElementById("progressWrapper").classList.add("hidden");
+    }
+
+    async function pollJob(jobId) {
+      let job;
       try {
-        const res = await fetch("/progress");
-        if (!res.ok) return;
-        const data = await res.json();
-
-        if (data.total > 0 && !progressStarted) {
-          progressStarted = true;
-          log("Downloading songs...");
+        const res = await fetch("/progress?job=" + encodeURIComponent(jobId));
+        if (!res.ok) {
+          // the job vanished (server restarted) — nothing more to wait for
+          stopPolling();
+          log("Lost track of the job on the server. Please try again.");
+          return;
         }
-
-        setProgress(data.done, data.total);
-
-        if (data.total > 0 && data.done >= data.total) {
-          // all songs processed on the server
-          clearInterval(progressTimer);
-          progressTimer = null;
-        }
+        job = await res.json();
       } catch (e) {
-        // ignore polling errors
+        return; // transient network blip, try again next tick
       }
+
+      setProgress(job.done, job.total);
+
+      if (job.status === "running") return;
+
+      stopPolling();
+
+      if (job.status === "error") {
+        log(job.error || "Server error.");
+        job.failures.forEach((f) => log("  • " + f));
+        return;
+      }
+
+      // status === "ready"
+      log(
+        `Got ${job.downloaded} of ${job.total} song(s), ${formatBytes(job.zipBytes)}` +
+          (job.failures.length ? ` — ${job.failures.length} failed:` : "")
+      );
+      job.failures.forEach((f) => log("  • " + f));
+
+      // Let the browser download the ZIP itself: it streams straight to disk
+      // with its own progress indicator instead of buffering it in the page.
+      window.location.href = "/download/" + encodeURIComponent(job.id);
+      log("Saving songs.zip — watch your browser's downloads.");
     }
 
     async function uploadCSV() {
@@ -183,62 +210,43 @@
         return;
       }
 
+      if (progressTimer) {
+        log("A run is already in progress.");
+        return;
+      }
+
       const formData = new FormData();
       formData.append("csv", fileInput.files[0]);
       formData.append("quality", qualitySelect.value);
 
-      // show progress bar on click
       progressWrapper.classList.remove("hidden");
-      progressStarted = false;
       setProgress(0, 0);
-
       log("Uploading CSV…");
 
-      // start polling progress as soon as we send request
-      if (!progressTimer) {
-        progressTimer = setInterval(pollProgress, 1000);
-      }
-
-      const response = await fetch("/upload", {
-        method: "POST",
-        body: formData
-      });
-
-      if (!response.ok) {
-        let detail = null;
-        try {
-          detail = await response.json();
-        } catch (e) {
-          // non-JSON error body
-        }
-
-        log(detail?.error || "Server error.");
-        (detail?.failures || []).forEach((f) => log("  • " + f));
+      let response;
+      try {
+        response = await fetch("/upload", { method: "POST", body: formData });
+      } catch (e) {
+        log("Could not reach the server. Is it running?");
         progressWrapper.classList.add("hidden");
         return;
       }
 
-      log("Processing… preparing download…");
-
-      const downloaded = response.headers.get("X-Zipify-Downloaded");
-      const failed = response.headers.get("X-Zipify-Failed");
-      if (downloaded) {
-        log(`Got ${downloaded} song(s)` + (Number(failed) ? `, ${failed} failed` : ""));
+      let body = null;
+      try {
+        body = await response.json();
+      } catch (e) {
+        // non-JSON body
       }
 
-      // Server sends a ZIP file of all MP3s
-      const blob = await response.blob();
-      const url = window.URL.createObjectURL(blob);
+      if (!response.ok || !body?.jobId) {
+        log(body?.error || "Server error.");
+        progressWrapper.classList.add("hidden");
+        return;
+      }
 
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "songs.zip";
-      a.click();
-
-      log("Download ready!");
-
-      // hide progress bar when everything is done
-      progressWrapper.classList.add("hidden");
+      log("Downloading songs…");
+      progressTimer = setInterval(() => pollJob(body.jobId), 1000);
     }
   </script>
 </body>

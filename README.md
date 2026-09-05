@@ -30,7 +30,7 @@ ZipifyTunes lets you take back control; your music, your files, your way.
 - **Covers:** iTunes Search API provides square artwork, saved temporarily then embedded
 - **Tagging:** `ffmpeg` writes ID3 tags: title, artist, album, year, genre + embedded cover
 - **Packaging:** `archiver` builds a ZIP of all generated MP3s and streams it back to your browser
-- **Disk space:** a run briefly needs about three times the playlist size free (the temp MP3s, the ZIP your browser buffers, and the copy it saves), so roughly 30 MB per track. ZipifyTunes checks this up front and refuses with a clear message instead of handing back a truncated ZIP
+- **Disk space:** a run needs about twice the playlist size free (the temp MP3s plus the ZIP your browser saves), so roughly 20 MB per track. ZipifyTunes checks this up front and refuses with a clear message instead of handing back a truncated ZIP
 
 ## Install & run
 

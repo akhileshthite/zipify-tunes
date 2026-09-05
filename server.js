@@ -14,8 +14,20 @@ const upload = multer({ dest: 'uploads/' })
 // serve index.html + assets
 app.use(express.static('.'))
 
-// simple in-memory progress tracker (single-user / local use)
-const progress = { total: 0, done: 0 }
+// In-memory jobs (single-user / local use). The upload request returns a job
+// id straight away; the page polls it and, once the tracks are ready, the
+// browser fetches /download/<id> as a normal file download.
+const jobs = new Map()
+
+// a finished job that is never downloaded shouldn't hold its MP3s forever
+const JOB_TTL_MS = 30 * 60 * 1000
+
+// leftovers from a crashed or killed run
+for (const entry of fs.readdirSync('.')) {
+  if (/^mp3s_\d+$/.test(entry)) {
+    fs.rmSync(entry, { recursive: true, force: true })
+  }
+}
 
 // YouTube keeps changing how it serves audio, so a yt-dlp binary that is a few
 // months old starts failing every download with "HTTP Error 403: Forbidden".
@@ -114,9 +126,10 @@ async function freeSpace (dir) {
 // rough guess used before anything is downloaded: MP3s land around 5-10 MB
 const ESTIMATED_BYTES_PER_TRACK = 10 * 1024 * 1024
 
-// A run briefly needs three copies of the audio on the same disk: the temp
-// MP3s, the ZIP the browser buffers while it downloads, and the copy it saves.
-const PEAK_COPIES = 3
+// A run needs two copies of the audio on the same disk: the temp MP3s and the
+// ZIP the browser saves. (The browser streams the ZIP straight to disk, so it
+// doesn't need a third, buffered copy.)
+const PEAK_COPIES = 2
 
 // strip case and separators so "Album Date", "album_date" and "albumdate"
 // all collapse to the same key (also drops any BOM left on the first header)
@@ -352,13 +365,46 @@ function applyMetadataAndCover (mp3Path, coverPath, meta) {
   })
 }
 
-// Simple endpoint for polling progress from frontend
+// what the page sees when it polls a job
+function publicJob (job) {
+  return {
+    id: job.id,
+    status: job.status, // running | ready | error
+    total: job.total,
+    done: job.done,
+    downloaded: job.mp3s.length,
+    zipBytes: job.zipBytes,
+    failures: job.failures.slice(0, 20),
+    error: job.error
+  }
+}
+
+async function removeJob (job) {
+  jobs.delete(job.id)
+  clearTimeout(job.expiry)
+  await fs.promises.rm(job.tempFolder, { recursive: true, force: true })
+}
+
+function failJob (job, message) {
+  console.log(message)
+  job.status = 'error'
+  job.error = message
+  removeJob(job).catch(() => {})
+}
+
+// Poll a job's progress
 app.get('/progress', (req, res) => {
-  res.json(progress)
+  const job = jobs.get(req.query.job)
+  if (!job) return res.status(404).json({ error: 'Unknown job' })
+  res.json(publicJob(job))
 })
 
-// Handle CSV upload → return ZIP
-app.post('/upload', upload.single('csv'), async (req, res) => {
+// Start a job: parse the CSV, kick off the downloads, return the job id
+app.post('/upload', upload.single('csv'), (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'No CSV file was uploaded.' })
+  }
+
   const csvPath = req.file.path
   const songs = []
   const userQuality = req.body.quality || '0'
@@ -366,258 +412,275 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
   fs.createReadStream(csvPath)
     .pipe(csv())
     .on('data', (row) => songs.push(row))
-    .on('end', async () => {
-      const tempFolder = 'mp3s_' + Date.now()
-      fs.mkdirSync(tempFolder)
-
-      const cleanup = async () => {
-        await fs.promises.rm(tempFolder, { recursive: true, force: true })
-        await fs.promises.rm(csvPath, { force: true })
-      }
-
-      progress.total = songs.length
-      progress.done = 0
-
-      // wait for the yt-dlp update check before touching the binary
-      await ytDlpReady
-
-      // Bail out now rather than downloading for minutes and handing back a
-      // ZIP the browser has no room to save.
-      const needed = songs.length * ESTIMATED_BYTES_PER_TRACK * PEAK_COPIES
-      const freeBefore = await freeSpace('.')
-
-      if (freeBefore < needed) {
-        console.log(
-          `Not enough disk space: ${formatBytes(freeBefore)} free, ` +
-            `need about ${formatBytes(needed)}`
-        )
-        res.status(507).json({
-          error:
-            `Not enough disk space. ${songs.length} tracks need about ` +
-            `${formatBytes(needed)} free, but only ${formatBytes(freeBefore)} ` +
-            'is available. Free up space, pick a lower quality, or split the ' +
-            'CSV into smaller batches.',
-          failures: []
-        })
-        await cleanup()
-        return
-      }
-
-      let trackNumber = 0
-      const failures = []
-
-      for (const s of songs) {
-        trackNumber++
-        try {
-          // UNIVERSAL FIELD DETECTION
-
-          const title = getField(s, [
-            'title',
-            'Title',
-            'track',
-            'Track',
-            'track_name',
-            'Track Name',
-            'trackName',
-            'name',
-            'Name',
-            'song',
-            'Song'
-          ])
-
-          const artist = getField(s, [
-            'artist',
-            'Artist',
-            'artists',
-            'Artists',
-            'artist_name',
-            'Artist Name',
-            'singer',
-            'Singer',
-            'performer',
-            'Performer'
-          ])
-
-          const album = getField(s, [
-            'album',
-            'Album',
-            'album_name',
-            'Album Name',
-            'albumName',
-            'record',
-            'Record',
-            'release',
-            'Release'
-          ])
-
-          const year = getYear(s)
-          const genre = getGenre(s)
-
-          if (!title || !artist) {
-            console.log('Skipping row (no title/artist):', s)
-            failures.push('Row with no title/artist')
-            progress.done++
-            continue
-          }
-
-          const query = `${title} ${artist}`
-          console.log('Searching:', query)
-
-          const results = await yts(query)
-          const video = results.videos[0]
-          if (!video) {
-            console.log('No video found for:', query)
-            failures.push(`${query} — no YouTube match`)
-            progress.done++
-            continue
-          }
-
-          // filename ONLY from title, with spaces (no underscores)
-          const fileBase = makeFileBaseFromTitle(title)
-
-          // Download to a predictable ASCII name so we always know where the
-          // file landed (yt-dlp sanitizes its own output names), then rename to
-          // the pretty title once it's tagged.
-          const workBase = `track_${trackNumber}`
-          const outputTemplate = `${tempFolder}/${workBase}.%(ext)s`
-          const mp3Path = `${tempFolder}/${workBase}.mp3`
-
-          // 1) download pure audio
-          await downloadMP3(video.url, outputTemplate, userQuality)
-
-          if (!fs.existsSync(mp3Path)) {
-            console.log('yt-dlp produced no MP3 for:', query)
-            failures.push(`${query} — no MP3 produced`)
-            progress.done++
-            continue
-          }
-
-          // 2) fetch nice square album art (movie/album style)
-          const coverPath = await fetchAlbumArt(
-            title,
-            artist,
-            tempFolder,
-            workBase
-          )
-
-          // 3) apply metadata from CSV + embed cover
-          try {
-            await applyMetadataAndCover(mp3Path, coverPath, {
-              title,
-              artist,
-              album,
-              year,
-              genre
-            })
-          } catch (tagErr) {
-            console.log(
-              'Tagging / cover error (keeping audio anyway):',
-              tagErr
-            )
-          }
-
-          const finalPath = await renameToUniqueTitle(
-            mp3Path,
-            tempFolder,
-            fileBase
-          )
-          console.log('Tagged & Downloaded:', finalPath)
-        } catch (err) {
-          console.log('Error downloading:', err.stderr || err.message || err)
-          failures.push(describeRowFailure(s, err))
-        } finally {
-          progress.done++
-        }
-      }
-
-      // when we're done, reset progress after a little while (optional)
-      setTimeout(() => {
-        progress.total = 0
-        progress.done = 0
-      }, 60_000)
-
-      const mp3s = fs
-        .readdirSync(tempFolder)
-        .filter((f) => f.toLowerCase().endsWith('.mp3'))
-
-      // Nothing downloaded: tell the browser why instead of shipping an empty ZIP
-      if (!mp3s.length) {
-        console.log('No MP3s were downloaded, sending error instead of ZIP')
-        res.status(502).json({
-          error: songs.length
-            ? 'No songs could be downloaded.'
-            : 'The CSV had no rows.',
-          failures: failures.slice(0, 20)
-        })
-        await cleanup()
-        return
-      }
-
-      // Re-check with the real sizes now that the MP3s exist. A stored ZIP is
-      // about the size of the audio inside it, and the browser needs room for
-      // both the copy it buffers and the copy it saves.
-      const zipBytes = mp3s.reduce(
-        (sum, name) => sum + fs.statSync(path.join(tempFolder, name)).size,
-        0
-      )
-      const neededNow = zipBytes * (PEAK_COPIES - 1)
-      const freeNow = await freeSpace('.')
-
-      if (freeNow < neededNow) {
-        console.log(
-          `Not enough room for the ZIP: needs ${formatBytes(neededNow)}, ` +
-            `only ${formatBytes(freeNow)} free`
-        )
-        res.status(507).json({
-          error:
-            `Downloaded ${mp3s.length} tracks (${formatBytes(zipBytes)}), but ` +
-            `saving the ZIP needs ${formatBytes(neededNow)} free and only ` +
-            `${formatBytes(freeNow)} is available. Free up some disk space ` +
-            'and try again.',
-          failures: failures.slice(0, 20)
-        })
-        await cleanup()
-        return
-      }
-
-      console.log(
-        `Zipping ${mp3s.length} of ${songs.length} tracks, ` +
-          `${formatBytes(zipBytes)}` +
-          (failures.length ? ` (${failures.length} failed)` : '')
-      )
-
-      // Create ZIP to send to user
-      res.setHeader('Content-Type', 'application/zip')
-      res.setHeader('Content-Disposition', 'attachment; filename=songs.zip')
-      res.setHeader('X-Zipify-Downloaded', String(mp3s.length))
-      res.setHeader('X-Zipify-Failed', String(failures.length))
-
-      // store, don't deflate: MP3s are already compressed, so deflating 100s of
-      // MB of audio burns CPU for about nothing
-      const zip = archiver('zip', { store: true })
-      zip.on('error', (err) => console.log('ZIP error:', err))
-      zip.pipe(res)
-
-      // add the MP3s by name so a leftover cover JPG can't sneak into the ZIP
-      for (const name of mp3s) {
-        zip.file(path.join(tempFolder, name), { name })
-      }
-
-      // only remove the temp files once the ZIP has actually been streamed out
-      res.on('close', () => {
-        if (res.writableFinished) {
-          console.log('ZIP sent')
-        } else {
-          console.log(
-            'Client disconnected before the ZIP finished — the download is ' +
-              'incomplete (most often the browser ran out of disk space)'
-          )
-        }
-        cleanup().catch(() => {})
-      })
-
-      zip.finalize()
+    .on('error', (err) => {
+      fs.promises.rm(csvPath, { force: true }).catch(() => {})
+      res.status(400).json({ error: 'Could not parse CSV: ' + err.message })
     })
+    .on('end', () => {
+      // the CSV is fully in memory now
+      fs.promises.rm(csvPath, { force: true }).catch(() => {})
+
+      if (!songs.length) {
+        return res.status(400).json({ error: 'The CSV had no rows.' })
+      }
+
+      const job = {
+        id: String(Date.now()),
+        status: 'running',
+        total: songs.length,
+        done: 0,
+        mp3s: [],
+        zipBytes: 0,
+        failures: [],
+        error: null,
+        tempFolder: 'mp3s_' + Date.now(),
+        expiry: null
+      }
+      jobs.set(job.id, job)
+      fs.mkdirSync(job.tempFolder)
+
+      res.json({ jobId: job.id })
+
+      runJob(job, songs, userQuality).catch((err) => {
+        failJob(job, 'Unexpected error: ' + (err.message || err))
+      })
+    })
+})
+
+async function runJob (job, songs, userQuality) {
+  const { tempFolder, failures } = job
+
+  // wait for the yt-dlp update check before touching the binary
+  await ytDlpReady
+
+  // Bail out now rather than downloading for minutes and handing back a ZIP
+  // the browser has no room to save.
+  const needed = songs.length * ESTIMATED_BYTES_PER_TRACK * PEAK_COPIES
+  const freeBefore = await freeSpace('.')
+
+  if (freeBefore < needed) {
+    failJob(
+      job,
+      `Not enough disk space. ${songs.length} tracks need about ` +
+        `${formatBytes(needed)} free, but only ${formatBytes(freeBefore)} ` +
+        'is available. Free up space, pick a lower quality, or split the ' +
+        'CSV into smaller batches.'
+    )
+    return
+  }
+
+  let trackNumber = 0
+
+  for (const s of songs) {
+    trackNumber++
+    try {
+      // UNIVERSAL FIELD DETECTION
+
+      const title = getField(s, [
+        'title',
+        'Title',
+        'track',
+        'Track',
+        'track_name',
+        'Track Name',
+        'trackName',
+        'name',
+        'Name',
+        'song',
+        'Song'
+      ])
+
+      const artist = getField(s, [
+        'artist',
+        'Artist',
+        'artists',
+        'Artists',
+        'artist_name',
+        'Artist Name',
+        'singer',
+        'Singer',
+        'performer',
+        'Performer'
+      ])
+
+      const album = getField(s, [
+        'album',
+        'Album',
+        'album_name',
+        'Album Name',
+        'albumName',
+        'record',
+        'Record',
+        'release',
+        'Release'
+      ])
+
+      const year = getYear(s)
+      const genre = getGenre(s)
+
+      if (!title || !artist) {
+        console.log('Skipping row (no title/artist):', s)
+        failures.push('Row with no title/artist')
+        job.done++
+        continue
+      }
+
+      const query = `${title} ${artist}`
+      console.log('Searching:', query)
+
+      const results = await yts(query)
+      const video = results.videos[0]
+      if (!video) {
+        console.log('No video found for:', query)
+        failures.push(`${query} — no YouTube match`)
+        job.done++
+        continue
+      }
+
+      // filename ONLY from title, with spaces (no underscores)
+      const fileBase = makeFileBaseFromTitle(title)
+
+      // Download to a predictable ASCII name so we always know where the
+      // file landed (yt-dlp sanitizes its own output names), then rename to
+      // the pretty title once it's tagged.
+      const workBase = `track_${trackNumber}`
+      const outputTemplate = `${tempFolder}/${workBase}.%(ext)s`
+      const mp3Path = `${tempFolder}/${workBase}.mp3`
+
+      // 1) download pure audio
+      await downloadMP3(video.url, outputTemplate, userQuality)
+
+      if (!fs.existsSync(mp3Path)) {
+        console.log('yt-dlp produced no MP3 for:', query)
+        failures.push(`${query} — no MP3 produced`)
+        job.done++
+        continue
+      }
+
+      // 2) fetch nice square album art (movie/album style)
+      const coverPath = await fetchAlbumArt(
+        title,
+        artist,
+        tempFolder,
+        workBase
+      )
+
+      // 3) apply metadata from CSV + embed cover
+      try {
+        await applyMetadataAndCover(mp3Path, coverPath, {
+          title,
+          artist,
+          album,
+          year,
+          genre
+        })
+      } catch (tagErr) {
+        console.log(
+          'Tagging / cover error (keeping audio anyway):',
+          tagErr
+        )
+      }
+
+      const finalPath = await renameToUniqueTitle(
+        mp3Path,
+        tempFolder,
+        fileBase
+      )
+      console.log('Tagged & Downloaded:', finalPath)
+    } catch (err) {
+      console.log('Error downloading:', err.stderr || err.message || err)
+      failures.push(describeRowFailure(s, err))
+    } finally {
+      job.done++
+    }
+  }
+
+  const mp3s = fs
+    .readdirSync(tempFolder)
+    .filter((f) => f.toLowerCase().endsWith('.mp3'))
+
+  if (!mp3s.length) {
+    failJob(job, 'No songs could be downloaded.')
+    return
+  }
+
+  // Re-check with the real sizes now that the MP3s exist: the ZIP the browser
+  // saves is about the size of the audio inside it.
+  const zipBytes = mp3s.reduce(
+    (sum, name) => sum + fs.statSync(path.join(tempFolder, name)).size,
+    0
+  )
+  const neededNow = zipBytes * (PEAK_COPIES - 1)
+  const freeNow = await freeSpace('.')
+
+  if (freeNow < neededNow) {
+    failJob(
+      job,
+      `Downloaded ${mp3s.length} tracks (${formatBytes(zipBytes)}), but ` +
+        `saving the ZIP needs ${formatBytes(neededNow)} free and only ` +
+        `${formatBytes(freeNow)} is available. Free up some disk space and ` +
+        'try again.'
+    )
+    return
+  }
+
+  job.mp3s = mp3s
+  job.zipBytes = zipBytes
+  job.status = 'ready'
+  job.expiry = setTimeout(() => {
+    console.log(`Job ${job.id} was never downloaded, cleaning up`)
+    removeJob(job).catch(() => {})
+  }, JOB_TTL_MS)
+
+  console.log(
+    `Ready: ${mp3s.length} of ${songs.length} tracks, ${formatBytes(zipBytes)}` +
+      (failures.length ? ` (${failures.length} failed)` : '')
+  )
+}
+
+// Stream the ZIP as a normal browser download. Nothing is buffered on either
+// side: archiver reads the MP3s and the browser writes straight to disk.
+app.get('/download/:id', (req, res) => {
+  const job = jobs.get(req.params.id)
+
+  if (!job || job.status !== 'ready') {
+    return res
+      .status(404)
+      .send('This download is no longer available. Run the CSV again.')
+  }
+
+  // a second click while the first download is running would fight over the
+  // same files, so hand the job to this response only
+  jobs.delete(job.id)
+  clearTimeout(job.expiry)
+
+  res.setHeader('Content-Type', 'application/zip')
+  res.setHeader('Content-Disposition', 'attachment; filename="songs.zip"')
+
+  // store, don't deflate: MP3s are already compressed, so deflating 100s of MB
+  // of audio burns CPU for about nothing
+  const zip = archiver('zip', { store: true })
+  zip.on('error', (err) => console.log('ZIP error:', err))
+  zip.pipe(res)
+
+  // add the MP3s by name so a leftover cover JPG can't sneak into the ZIP
+  for (const name of job.mp3s) {
+    zip.file(path.join(job.tempFolder, name), { name })
+  }
+
+  // only remove the temp files once the ZIP has actually been streamed out
+  res.on('close', () => {
+    if (res.writableFinished) {
+      console.log(`ZIP sent (${formatBytes(job.zipBytes)})`)
+    } else {
+      console.log('Browser disconnected before the ZIP finished')
+    }
+    fs.promises
+      .rm(job.tempFolder, { recursive: true, force: true })
+      .catch(() => {})
+  })
+
+  zip.finalize()
 })
 
 const port = process.env.PORT || 3000
