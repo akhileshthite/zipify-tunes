@@ -101,6 +101,23 @@ function describeRowFailure (row, err) {
   return `${label} — ${reason.replace(/^ERROR:\s*/, '')}`
 }
 
+function formatBytes (bytes) {
+  if (bytes >= 1024 ** 3) return (bytes / 1024 ** 3).toFixed(1) + ' GB'
+  return Math.round(bytes / 1024 ** 2) + ' MB'
+}
+
+async function freeSpace (dir) {
+  const { bavail, bsize } = await fs.promises.statfs(dir)
+  return bavail * bsize
+}
+
+// rough guess used before anything is downloaded: MP3s land around 5-10 MB
+const ESTIMATED_BYTES_PER_TRACK = 10 * 1024 * 1024
+
+// A run briefly needs three copies of the audio on the same disk: the temp
+// MP3s, the ZIP the browser buffers while it downloads, and the copy it saves.
+const PEAK_COPIES = 3
+
 // strip case and separators so "Album Date", "album_date" and "albumdate"
 // all collapse to the same key (also drops any BOM left on the first header)
 function normalizeKey (key) {
@@ -353,11 +370,38 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
       const tempFolder = 'mp3s_' + Date.now()
       fs.mkdirSync(tempFolder)
 
+      const cleanup = async () => {
+        await fs.promises.rm(tempFolder, { recursive: true, force: true })
+        await fs.promises.rm(csvPath, { force: true })
+      }
+
       progress.total = songs.length
       progress.done = 0
 
       // wait for the yt-dlp update check before touching the binary
       await ytDlpReady
+
+      // Bail out now rather than downloading for minutes and handing back a
+      // ZIP the browser has no room to save.
+      const needed = songs.length * ESTIMATED_BYTES_PER_TRACK * PEAK_COPIES
+      const freeBefore = await freeSpace('.')
+
+      if (freeBefore < needed) {
+        console.log(
+          `Not enough disk space: ${formatBytes(freeBefore)} free, ` +
+            `need about ${formatBytes(needed)}`
+        )
+        res.status(507).json({
+          error:
+            `Not enough disk space. ${songs.length} tracks need about ` +
+            `${formatBytes(needed)} free, but only ${formatBytes(freeBefore)} ` +
+            'is available. Free up space, pick a lower quality, or split the ' +
+            'CSV into smaller batches.',
+          failures: []
+        })
+        await cleanup()
+        return
+      }
 
       let trackNumber = 0
       const failures = []
@@ -492,11 +536,6 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
         progress.done = 0
       }, 60_000)
 
-      const cleanup = async () => {
-        await fs.promises.rm(tempFolder, { recursive: true, force: true })
-        await fs.promises.rm(csvPath, { force: true })
-      }
-
       const mp3s = fs
         .readdirSync(tempFolder)
         .filter((f) => f.toLowerCase().endsWith('.mp3'))
@@ -514,8 +553,36 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
         return
       }
 
+      // Re-check with the real sizes now that the MP3s exist. A stored ZIP is
+      // about the size of the audio inside it, and the browser needs room for
+      // both the copy it buffers and the copy it saves.
+      const zipBytes = mp3s.reduce(
+        (sum, name) => sum + fs.statSync(path.join(tempFolder, name)).size,
+        0
+      )
+      const neededNow = zipBytes * (PEAK_COPIES - 1)
+      const freeNow = await freeSpace('.')
+
+      if (freeNow < neededNow) {
+        console.log(
+          `Not enough room for the ZIP: needs ${formatBytes(neededNow)}, ` +
+            `only ${formatBytes(freeNow)} free`
+        )
+        res.status(507).json({
+          error:
+            `Downloaded ${mp3s.length} tracks (${formatBytes(zipBytes)}), but ` +
+            `saving the ZIP needs ${formatBytes(neededNow)} free and only ` +
+            `${formatBytes(freeNow)} is available. Free up some disk space ` +
+            'and try again.',
+          failures: failures.slice(0, 20)
+        })
+        await cleanup()
+        return
+      }
+
       console.log(
-        `Zipping ${mp3s.length} of ${songs.length} tracks` +
+        `Zipping ${mp3s.length} of ${songs.length} tracks, ` +
+          `${formatBytes(zipBytes)}` +
           (failures.length ? ` (${failures.length} failed)` : '')
       )
 
@@ -525,7 +592,9 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
       res.setHeader('X-Zipify-Downloaded', String(mp3s.length))
       res.setHeader('X-Zipify-Failed', String(failures.length))
 
-      const zip = archiver('zip')
+      // store, don't deflate: MP3s are already compressed, so deflating 100s of
+      // MB of audio burns CPU for about nothing
+      const zip = archiver('zip', { store: true })
       zip.on('error', (err) => console.log('ZIP error:', err))
       zip.pipe(res)
 
@@ -536,6 +605,14 @@ app.post('/upload', upload.single('csv'), async (req, res) => {
 
       // only remove the temp files once the ZIP has actually been streamed out
       res.on('close', () => {
+        if (res.writableFinished) {
+          console.log('ZIP sent')
+        } else {
+          console.log(
+            'Client disconnected before the ZIP finished — the download is ' +
+              'incomplete (most often the browser ran out of disk space)'
+          )
+        }
         cleanup().catch(() => {})
       })
 
